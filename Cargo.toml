@@ -1,0 +1,24 @@
+[package]
+name = "tauri-plugin-thumbnail"
+version = "0.1.0"
+authors = [ "You" ]
+description = ""
+edition = "2021"
+rust-version = "1.77.2"
+exclude = ["/examples", "/dist-js", "/guest-js", "/node_modules"]
+links = "tauri-plugin-thumbnail"
+
+[dependencies]
+tauri = { version = "2.10.3" }
+serde = "1.0"
+thiserror = "2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+url = "2.5"
+md5 = "0.7"
+home = "0.5"
+base64 = "0.22"
+infer = "0.16"
+id3 = "1.16"
+
+[build-dependencies]
+tauri-plugin = { version = "2.5.4", features = ["build"] }
