@@ -1,5 +1,6 @@
 use crate::models::*;
 use image::ImageFormat;
+use image::imageops::FilterType;
 use md5;
 use serde::de::DeserializeOwned;
 use std::fs;
@@ -39,6 +40,7 @@ impl<R: Runtime> Thumbnail<R> {
         #[cfg(target_os = "linux")]
         {
             if let Ok(thumb_data) = self.get_linux_thumbnail(&payload.path) {
+                let thumb_data = ensure_thumbnail_size_under_100kb(thumb_data)?;
                 return Ok(GetThumbnailResponse {
                     thumbnail: thumb_data,
                     mime_type: "image/png".to_string(), // Freedesktop thumbnails are always PNG
@@ -49,6 +51,7 @@ impl<R: Runtime> Thumbnail<R> {
         #[cfg(target_os = "windows")]
         {
             if let Ok(thumb_data) = self.get_windows_thumbnail(&payload.path) {
+                let thumb_data = ensure_thumbnail_size_under_100kb(thumb_data)?;
                 return Ok(GetThumbnailResponse {
                     thumbnail: thumb_data,
                     mime_type: "image/png".to_string(),
@@ -59,6 +62,7 @@ impl<R: Runtime> Thumbnail<R> {
         #[cfg(target_os = "macos")]
         {
             if let Ok(thumb_data) = self.get_macos_thumbnail(&payload.path) {
+                let thumb_data = ensure_thumbnail_size_under_100kb(thumb_data)?;
                 return Ok(GetThumbnailResponse {
                     thumbnail: thumb_data,
                     mime_type: "image/png".to_string(),
@@ -76,7 +80,7 @@ impl<R: Runtime> Thumbnail<R> {
         let (width, height) = if payload.width.is_some() && payload.height.is_some() {
             (payload.width.unwrap(), payload.height.unwrap())
         } else {
-            (128, 128)
+            (64, 64)
         };
 
         println!("Getting thumbnail from fallback");
@@ -88,8 +92,9 @@ impl<R: Runtime> Thumbnail<R> {
             let mut buffer = std::io::Cursor::new(Vec::new());
             thumb.write_to(&mut buffer, ImageFormat::Png)?;
 
+            let thumb_data = ensure_thumbnail_size_under_100kb(buffer.into_inner())?;
             return Ok(GetThumbnailResponse {
-                thumbnail: buffer.into_inner(),
+                thumbnail: thumb_data,
                 mime_type: "image/png".to_string(),
             });
         }
@@ -104,8 +109,9 @@ impl<R: Runtime> Thumbnail<R> {
                     let mut buffer = std::io::Cursor::new(Vec::new());
                     thumb.write_to(&mut buffer, ImageFormat::Png)?;
 
+                    let thumb_data = ensure_thumbnail_size_under_100kb(buffer.into_inner())?;
                     return Ok(GetThumbnailResponse {
-                        thumbnail: buffer.into_inner(),
+                        thumbnail: thumb_data,
                         mime_type: "image/png".to_string(),
                     });
                 }
@@ -138,8 +144,9 @@ impl<R: Runtime> Thumbnail<R> {
                 if out.status.success() {
                     if let Ok(data) = fs::read(&thumb_path) {
                         let _ = fs::remove_file(thumb_path);
+                        let thumb_data = ensure_thumbnail_size_under_100kb(data)?;
                         return Ok(GetThumbnailResponse {
-                            thumbnail: data,
+                            thumbnail: thumb_data,
                             mime_type: "image/png".to_string(),
                         });
                     }
@@ -172,8 +179,9 @@ impl<R: Runtime> Thumbnail<R> {
                 if out.status.success() {
                     if let Ok(data) = fs::read(&thumb_path) {
                         let _ = fs::remove_file(thumb_path);
+                        let thumb_data = ensure_thumbnail_size_under_100kb(data)?;
                         return Ok(GetThumbnailResponse {
-                            thumbnail: data,
+                            thumbnail: thumb_data,
                             mime_type: "image/png".to_string(),
                         });
                     }
@@ -263,7 +271,7 @@ impl<R: Runtime> Thumbnail<R> {
         let ql_output = Command::new("qlmanage")
             .args([
                 "-t", // thumbnail mode
-                "-s", "512", // size
+                "-s", "128", // size
                 "-o", "/tmp", // output dir
                 file_path,
             ])
@@ -288,7 +296,7 @@ impl<R: Runtime> Thumbnail<R> {
 
         let sips_output = Command::new("sips")
             .args([
-                "-s", "format", "png", "-Z", "512", "-o", &tmp_file, file_path,
+                "-s", "format", "png", "-Z", "128", "-o", &tmp_file, file_path,
             ])
             .output();
 
@@ -303,6 +311,22 @@ impl<R: Runtime> Thumbnail<R> {
 
         Err(crate::Error::NotFound)
     }
+}
+
+fn ensure_thumbnail_size_under_100kb(mut data: Vec<u8>) -> crate::Result<Vec<u8>> {
+    while data.len() > 100 * 1024 {
+        let img = image::load_from_memory(&data)?;
+        let width = img.width() / 2;
+        let height = img.height() / 2;
+        if width < 16 || height < 16 {
+            break;
+        }
+        let resized = img.resize(width, height, image::imageops::FilterType::Lanczos3);
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        resized.write_to(&mut buffer, ImageFormat::Png)?;
+        data = buffer.into_inner();
+    }
+    Ok(data)
 }
 
 fn hash_path(path: &Path) -> String {
