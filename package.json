@@ -1,8 +1,8 @@
 {
-  "name": "tauri-plugin-thumbnail-api",
+  "name": "tauri-plugin-thumbnail",
   "version": "0.1.0",
-  "author": "You",
-  "description": "",
+  "author": "kenk-induz",
+  "description": "Generate and retrieve file thumbnails in Tauri applications.",
   "type": "module",
   "types": "./dist-js/index.d.ts",
   "main": "./dist-js/index.cjs",

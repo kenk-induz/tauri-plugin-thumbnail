@@ -1,11 +1,17 @@
 use crate::models::*;
+use home::home_dir;
 use image::ImageFormat;
-use image::imageops::FilterType;
+use log::{debug, warn};
 use md5;
 use serde::de::DeserializeOwned;
-use std::fs;
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::{Cursor, Read};
+use std::path::{Path, PathBuf};
 use tauri::{plugin::PluginApi, AppHandle, Runtime};
+use url::Url;
+
+/// Maximum size for a thumbnail to be considered "ready" without further compression.
+const MAX_THUMBNAIL_SIZE: usize = 200 * 1024; // 200KB
 
 pub fn init<R: Runtime, C: DeserializeOwned>(
     app: &AppHandle<R>,
@@ -18,12 +24,7 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 pub struct Thumbnail<R: Runtime>(AppHandle<R>);
 
 impl<R: Runtime> Thumbnail<R> {
-    pub fn ping(&self, payload: PingRequest) -> crate::Result<PingResponse> {
-        Ok(PingResponse {
-            value: payload.value,
-        })
-    }
-
+    /// Generates or retrieves a thumbnail for the specified file path.
     pub fn get_thumbnail(
         &self,
         payload: GetThumbnailRequest,
@@ -32,26 +33,18 @@ impl<R: Runtime> Thumbnail<R> {
         if !path.exists() {
             return Err(crate::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "File not found",
+                format!("File not found: {}", payload.path),
             )));
         }
 
-        // 1. Try OS-native thumbnail (Linux Freedesktop spec)
+        let width = payload.width.unwrap_or(128);
+        let height = payload.height.unwrap_or(128);
+
+        // 1. Try OS-native thumbnail
         #[cfg(target_os = "linux")]
         {
             if let Ok(thumb_data) = self.get_linux_thumbnail(&payload.path) {
-                let thumb_data = ensure_thumbnail_size_under_100kb(thumb_data)?;
-                return Ok(GetThumbnailResponse {
-                    thumbnail: thumb_data,
-                    mime_type: "image/png".to_string(), // Freedesktop thumbnails are always PNG
-                });
-            }
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            if let Ok(thumb_data) = self.get_windows_thumbnail(&payload.path) {
-                let thumb_data = ensure_thumbnail_size_under_100kb(thumb_data)?;
+                debug!("Found native Linux thumbnail for {}", payload.path);
                 return Ok(GetThumbnailResponse {
                     thumbnail: thumb_data,
                     mime_type: "image/png".to_string(),
@@ -61,8 +54,19 @@ impl<R: Runtime> Thumbnail<R> {
 
         #[cfg(target_os = "macos")]
         {
-            if let Ok(thumb_data) = self.get_macos_thumbnail(&payload.path) {
-                let thumb_data = ensure_thumbnail_size_under_100kb(thumb_data)?;
+            if let Ok(thumb_data) = self.get_macos_thumbnail(&payload.path, width, height) {
+                debug!("Found native macOS thumbnail for {}", payload.path);
+                return Ok(GetThumbnailResponse {
+                    thumbnail: thumb_data,
+                    mime_type: "image/png".to_string(),
+                });
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(thumb_data) = self.get_windows_thumbnail(&payload.path, width, height) {
+                debug!("Found native Windows thumbnail for {}", payload.path);
                 return Ok(GetThumbnailResponse {
                     thumbnail: thumb_data,
                     mime_type: "image/png".to_string(),
@@ -71,28 +75,28 @@ impl<R: Runtime> Thumbnail<R> {
         }
 
         // 2. Fallback to manual generation
-        let file_content = fs::read(path)?;
-        let kind = infer::get(&file_content);
+        debug!("Falling back to manual thumbnail generation for {}", payload.path);
+        
+        // Only read enough to infer type
+        let mut file = File::open(path)?;
+        let mut header = [0u8; 8192];
+        let read_count = file.read(&mut header)?;
+        let kind = infer::get(&header[..read_count]);
         let mime = kind
             .map(|k| k.mime_type())
             .unwrap_or("application/octet-stream");
 
-        let (width, height) = if payload.width.is_some() && payload.height.is_some() {
-            (payload.width.unwrap(), payload.height.unwrap())
-        } else {
-            (64, 64)
-        };
-
-        println!("Getting thumbnail from fallback");
         // Handle Images
         if mime.starts_with("image/") {
+            // Re-read for image crate (full load is unfortunately often required for images)
+            let file_content = fs::read(path)?;
             let img = image::load_from_memory(&file_content)?;
             let thumb = img.thumbnail(width, height);
 
-            let mut buffer = std::io::Cursor::new(Vec::new());
+            let mut buffer = Cursor::new(Vec::new());
             thumb.write_to(&mut buffer, ImageFormat::Png)?;
 
-            let thumb_data = ensure_thumbnail_size_under_100kb(buffer.into_inner())?;
+            let thumb_data = optimize_thumbnail_size(buffer.into_inner())?;
             return Ok(GetThumbnailResponse {
                 thumbnail: thumb_data,
                 mime_type: "image/png".to_string(),
@@ -106,10 +110,10 @@ impl<R: Runtime> Thumbnail<R> {
                     let img = image::load_from_memory(&picture.data)?;
                     let thumb = img.thumbnail(width, height);
 
-                    let mut buffer = std::io::Cursor::new(Vec::new());
+                    let mut buffer = Cursor::new(Vec::new());
                     thumb.write_to(&mut buffer, ImageFormat::Png)?;
 
-                    let thumb_data = ensure_thumbnail_size_under_100kb(buffer.into_inner())?;
+                    let thumb_data = optimize_thumbnail_size(buffer.into_inner())?;
                     return Ok(GetThumbnailResponse {
                         thumbnail: thumb_data,
                         mime_type: "image/png".to_string(),
@@ -118,92 +122,40 @@ impl<R: Runtime> Thumbnail<R> {
             }
         }
 
-        // Handle Video (Best effort via system ffmpeg)
+        // Handle Video (via system ffmpeg)
         if mime.starts_with("video/") {
-            let temp_dir = std::env::temp_dir();
-            let thumb_path = temp_dir.join(format!("thumb_{}.png", hash_path(path)));
-
-            let output = std::process::Command::new("ffmpeg")
-                .args([
-                    "-i",
-                    &payload.path,
-                    "-ss",
-                    "00:00:01",
-                    "-vframes",
-                    "1",
-                    "-s",
-                    &format!("{}x{}", width, height),
-                    "-f",
-                    "image2",
-                    "-y",
-                    thumb_path.to_str().unwrap(),
-                ])
-                .output();
-
-            if let Ok(out) = output {
-                if out.status.success() {
-                    if let Ok(data) = fs::read(&thumb_path) {
-                        let _ = fs::remove_file(thumb_path);
-                        let thumb_data = ensure_thumbnail_size_under_100kb(data)?;
-                        return Ok(GetThumbnailResponse {
-                            thumbnail: thumb_data,
-                            mime_type: "image/png".to_string(),
-                        });
-                    }
-                }
+            if let Ok(thumb_data) = self.generate_video_thumbnail(path, width, height) {
+                return Ok(GetThumbnailResponse {
+                    thumbnail: thumb_data,
+                    mime_type: "image/png".to_string(),
+                });
             }
         }
 
-        // Handle PDF (Best effort via system pdftoppm)
+        // Handle PDF (via system pdftoppm)
         if mime == "application/pdf" {
-            let temp_dir = std::env::temp_dir();
-            let thumb_prefix = temp_dir.join(format!("thumb_pdf_{}", hash_path(path)));
-            let thumb_path = temp_dir.join(format!("thumb_pdf_{}.png", hash_path(path)));
-
-            let output = std::process::Command::new("pdftoppm")
-                .args([
-                    "-png",
-                    "-f",
-                    "1",
-                    "-l",
-                    "1",
-                    "-scale-to",
-                    &width.to_string(),
-                    "-singlefile",
-                    &payload.path,
-                    thumb_prefix.to_str().unwrap(),
-                ])
-                .output();
-
-            if let Ok(out) = output {
-                if out.status.success() {
-                    if let Ok(data) = fs::read(&thumb_path) {
-                        let _ = fs::remove_file(thumb_path);
-                        let thumb_data = ensure_thumbnail_size_under_100kb(data)?;
-                        return Ok(GetThumbnailResponse {
-                            thumbnail: thumb_data,
-                            mime_type: "image/png".to_string(),
-                        });
-                    }
-                }
+            if let Ok(thumb_data) = self.generate_pdf_thumbnail(path, width, height) {
+                return Ok(GetThumbnailResponse {
+                    thumbnail: thumb_data,
+                    mime_type: "image/png".to_string(),
+                });
             }
         }
 
+        warn!("Could not generate thumbnail for {}", payload.path);
         Err(crate::Error::NotFound)
     }
 
     #[cfg(target_os = "linux")]
     fn get_linux_thumbnail(&self, file_path: &str) -> crate::Result<Vec<u8>> {
-        println!("get_linux_thumbnail: {}", file_path);
         let abs_path = fs::canonicalize(file_path)?;
         let uri = Url::from_file_path(&abs_path).map_err(|_| crate::Error::NotFound)?;
         let hash = format!("{:x}", md5::compute(uri.as_str()));
 
         let cache_dir = std::env::var("XDG_CACHE_HOME")
-            .map(std::path::PathBuf::from)
+            .map(PathBuf::from)
             .unwrap_or_else(|_| home_dir().map(|h| h.join(".cache")).unwrap_or_default());
 
-        println!("Cache dir: {:?}", cache_dir);
         if cache_dir.as_os_str().is_empty() {
             return Err(crate::Error::NotFound);
         }
@@ -218,7 +170,6 @@ impl<R: Runtime> Thumbnail<R> {
         for dir in thumb_dirs {
             let thumb_path = dir.join(format!("{}.png", hash));
             if thumb_path.exists() {
-                println!("Thumbnail found at {:?}", thumb_path);
                 return Ok(fs::read(thumb_path)?);
             }
         }
@@ -227,82 +178,68 @@ impl<R: Runtime> Thumbnail<R> {
     }
 
     #[cfg(target_os = "windows")]
-    fn get_windows_thumbnail(&self, file_path: &str) -> crate::Result<Vec<u8>> {
-        use windows::Win32::UI::Shell::SHCreateItemFromParsingName;
-
-        // Create IFileExtractIcon
-        unsafe {
-            let item = SHCreateItemFromParsingName(
-                file_path,
-                None,
-                &windows::Win32::UI::Shell::IFileExtractIcon::IID,
-            )
-            .map_err(|_| crate::Error::NotFound)?;
-            let extract_icon: windows::Win32::UI::Shell::IFileExtractIcon =
-                std::mem::transmute_copy(&item);
-
-            // Create HICON (We need to implement the trait properly for this)
-            // For now, let's return an error or use a fallback if we can't easily implement the trait here
-        }
-
-        Err(crate::Error::UnsupportedType(
-            "Windows thumbnail extraction requires COM implementation".to_string(),
-        ))
+    fn get_windows_thumbnail(&self, file_path: &str, _width: u32, _height: u32) -> crate::Result<Vec<u8>> {
+        // Implementation for Windows using Shell API would go here.
+        // For now, we return NotFound to trigger fallback.
+        Err(crate::Error::NotFound)
     }
 
     #[cfg(target_os = "macos")]
-    fn get_macos_thumbnail(&self, file_path: &str) -> crate::Result<Vec<u8>> {
-        use std::{fs, path::Path, process::Command};
+    fn get_macos_thumbnail(&self, file_path: &str, width: u32, height: u32) -> crate::Result<Vec<u8>> {
+        use std::process::Command;
 
-        let cache_file = format!(
-            "/tmp/myapp_thumbs/{}.png",
-            hash_path(&std::path::Path::new(file_path))
-        );
+        let app_cache = self.0.path().app_cache_dir().unwrap_or_else(|_| std::env::temp_dir());
+        let plugin_cache = app_cache.join("tauri-plugin-thumbnail");
+        let _ = fs::create_dir_all(&plugin_cache);
 
-        // ✅ 1. Check YOUR cache
-        if let Ok(data) = fs::read(&cache_file) {
-            return Ok(data);
+        let hash = hash_path(Path::new(file_path));
+        let cache_file = plugin_cache.join(format!("{}.png", hash));
+
+        if cache_file.exists() {
+            return Ok(fs::read(cache_file)?);
         }
 
-        // Ensure cache dir exists
-        let _ = fs::create_dir_all("/tmp/myapp_thumbs");
-
-        // ✅ 2. Try Quick Look (better than sips)
+        // Try Quick Look (qlmanage)
         let ql_output = Command::new("qlmanage")
             .args([
-                "-t", // thumbnail mode
-                "-s", "128", // size
-                "-o", "/tmp", // output dir
+                "-t",
+                "-s", &width.to_string(),
+                "-o", plugin_cache.to_str().unwrap(),
                 file_path,
             ])
             .output();
 
         if let Ok(out) = ql_output {
             if out.status.success() {
-                let generated = format!(
-                    "/tmp/{}.png",
+                let generated_name = format!(
+                    "{}.png",
                     Path::new(file_path).file_name().unwrap().to_string_lossy()
                 );
+                let generated_path = plugin_cache.join(generated_name);
 
-                if let Ok(data) = fs::read(&generated) {
-                    let _ = fs::rename(&generated, &cache_file);
+                if generated_path.exists() {
+                    let data = fs::read(&generated_path)?;
+                    let _ = fs::rename(&generated_path, &cache_file);
                     return Ok(data);
                 }
             }
         }
 
-        // ✅ 3. Fallback to sips (images only)
-        let tmp_file = format!("/tmp/thumb_{}.png", hash_path(Path::new(file_path)));
-
+        // Fallback to sips
+        let tmp_file = plugin_cache.join(format!("tmp_{}.png", hash));
         let sips_output = Command::new("sips")
             .args([
-                "-s", "format", "png", "-Z", "128", "-o", &tmp_file, file_path,
+                "-s", "format", "png", 
+                "-Z", &width.max(height).to_string(), 
+                "-o", tmp_file.to_str().unwrap(), 
+                file_path,
             ])
             .output();
 
         if let Ok(out) = sips_output {
             if out.status.success() {
-                if let Ok(data) = fs::read(&tmp_file) {
+                if tmp_file.exists() {
+                    let data = fs::read(&tmp_file)?;
                     let _ = fs::rename(&tmp_file, &cache_file);
                     return Ok(data);
                 }
@@ -311,21 +248,83 @@ impl<R: Runtime> Thumbnail<R> {
 
         Err(crate::Error::NotFound)
     }
+
+    fn generate_video_thumbnail(&self, path: &Path, width: u32, height: u32) -> crate::Result<Vec<u8>> {
+        let temp_dir = std::env::temp_dir();
+        let thumb_path = temp_dir.join(format!("v_thumb_{}.png", hash_path(path)));
+
+        let output = std::process::Command::new("ffmpeg")
+            .args([
+                "-i",
+                &path.to_string_lossy(),
+                "-ss", "00:00:01",
+                "-vframes", "1",
+                "-s", &format!("{}x{}", width, height),
+                "-f", "image2",
+                "-y",
+                thumb_path.to_str().unwrap(),
+            ])
+            .output();
+
+        if let Ok(out) = output {
+            if out.status.success() {
+                if let Ok(data) = fs::read(&thumb_path) {
+                    let _ = fs::remove_file(thumb_path);
+                    return optimize_thumbnail_size(data);
+                }
+            }
+        }
+        Err(crate::Error::NotFound)
+    }
+
+    fn generate_pdf_thumbnail(&self, path: &Path, width: u32, _height: u32) -> crate::Result<Vec<u8>> {
+        let temp_dir = std::env::temp_dir();
+        let thumb_prefix = temp_dir.join(format!("p_thumb_{}", hash_path(path)));
+        let thumb_path = temp_dir.join(format!("p_thumb_{}.png", hash_path(path)));
+
+        let output = std::process::Command::new("pdftoppm")
+            .args([
+                "-png",
+                "-f", "1",
+                "-l", "1",
+                "-scale-to", &width.to_string(),
+                "-singlefile",
+                &path.to_string_lossy(),
+                thumb_prefix.to_str().unwrap(),
+            ])
+            .output();
+
+        if let Ok(out) = output {
+            if out.status.success() {
+                if let Ok(data) = fs::read(&thumb_path) {
+                    let _ = fs::remove_file(thumb_path);
+                    return optimize_thumbnail_size(data);
+                }
+            }
+        }
+        Err(crate::Error::NotFound)
+    }
 }
 
-fn ensure_thumbnail_size_under_100kb(mut data: Vec<u8>) -> crate::Result<Vec<u8>> {
-    while data.len() > 100 * 1024 {
-        let img = image::load_from_memory(&data)?;
-        let width = img.width() / 2;
-        let height = img.height() / 2;
-        if width < 16 || height < 16 {
-            break;
-        }
+fn optimize_thumbnail_size(mut data: Vec<u8>) -> crate::Result<Vec<u8>> {
+    if data.len() <= MAX_THUMBNAIL_SIZE {
+        return Ok(data);
+    }
+
+    let img = image::load_from_memory(&data)?;
+    let mut width = img.width();
+    let mut height = img.height();
+
+    // Resize by half until it fits or becomes too small
+    while data.len() > MAX_THUMBNAIL_SIZE && width > 32 && height > 32 {
+        width /= 2;
+        height /= 2;
         let resized = img.resize(width, height, image::imageops::FilterType::Lanczos3);
-        let mut buffer = std::io::Cursor::new(Vec::new());
+        let mut buffer = Cursor::new(Vec::new());
         resized.write_to(&mut buffer, ImageFormat::Png)?;
         data = buffer.into_inner();
     }
+    
     Ok(data)
 }
 

@@ -15,7 +15,7 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
   api: PluginApi<R, C>,
 ) -> crate::Result<Thumbnail<R>> {
   #[cfg(target_os = "android")]
-  let handle = api.register_android_plugin("", "ExamplePlugin")?;
+  let handle = api.register_android_plugin("", "ThumbnailPlugin")?;
   #[cfg(target_os = "ios")]
   let handle = api.register_ios_plugin(init_plugin_thumbnail)?;
   Ok(Thumbnail(handle))
@@ -25,10 +25,10 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 pub struct Thumbnail<R: Runtime>(PluginHandle<R>);
 
 impl<R: Runtime> Thumbnail<R> {
-  pub fn ping(&self, payload: PingRequest) -> crate::Result<PingResponse> {
+  pub fn get_thumbnail(&self, payload: GetThumbnailRequest) -> crate::Result<GetThumbnailResponse> {
     self
       .0
-      .run_mobile_plugin("ping", payload)
+      .run_mobile_plugin("getThumbnail", payload)
       .map_err(Into::into)
   }
 }

@@ -35,7 +35,7 @@ impl<R: Runtime, T: Manager<R>> crate::ThumbnailExt<R> for T {
 /// Initializes the plugin.
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
   Builder::new("thumbnail")
-    .invoke_handler(tauri::generate_handler![commands::ping, commands::get_thumbnail])
+    .invoke_handler(tauri::generate_handler![commands::get_thumbnail])
     .setup(|app, api| {
       #[cfg(mobile)]
       let thumbnail = mobile::init(app, api)?;
