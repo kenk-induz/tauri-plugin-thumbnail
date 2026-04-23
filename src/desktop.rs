@@ -1,12 +1,14 @@
 use crate::models::*;
+use home::home_dir;
 use image::ImageFormat;
 use log::{debug, warn};
 use md5;
 use serde::de::DeserializeOwned;
 use std::fs::{self, File};
 use std::io::{Cursor, Read};
-use std::path::{Path};
+use std::path::{Path, PathBuf};
 use tauri::{plugin::PluginApi, AppHandle, Runtime};
+use url::Url;
 
 /// Maximum size for a thumbnail to be considered "ready" without further compression.
 const MAX_THUMBNAIL_SIZE: usize = 200 * 1024; // 200KB
