@@ -1,14 +1,12 @@
 use crate::models::*;
-use home::home_dir;
 use image::ImageFormat;
 use log::{debug, warn};
 use md5;
 use serde::de::DeserializeOwned;
 use std::fs::{self, File};
 use std::io::{Cursor, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Path};
 use tauri::{plugin::PluginApi, AppHandle, Runtime};
-use url::Url;
 
 /// Maximum size for a thumbnail to be considered "ready" without further compression.
 const MAX_THUMBNAIL_SIZE: usize = 200 * 1024; // 200KB
@@ -75,8 +73,11 @@ impl<R: Runtime> Thumbnail<R> {
         }
 
         // 2. Fallback to manual generation
-        debug!("Falling back to manual thumbnail generation for {}", payload.path);
-        
+        debug!(
+            "Falling back to manual thumbnail generation for {}",
+            payload.path
+        );
+
         // Only read enough to infer type
         let mut file = File::open(path)?;
         let mut header = [0u8; 8192];
@@ -178,17 +179,111 @@ impl<R: Runtime> Thumbnail<R> {
     }
 
     #[cfg(target_os = "windows")]
-    fn get_windows_thumbnail(&self, file_path: &str, _width: u32, _height: u32) -> crate::Result<Vec<u8>> {
-        // Implementation for Windows using Shell API would go here.
-        // For now, we return NotFound to trigger fallback.
-        Err(crate::Error::NotFound)
+    fn get_windows_thumbnail(
+        &self,
+        file_path: &str,
+        width: u32,
+        height: u32,
+    ) -> crate::Result<Vec<u8>> {
+        use windows::{
+            core::*,
+            Win32::{Foundation::*, Graphics::Gdi::*, System::Com::*, UI::Shell::*},
+        };
+
+        let height = height.max(64);
+        let width = width.max(64);
+        unsafe {
+            // Initialize COM
+            if CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_err() {
+                return Err(crate::Error::NotFound);
+            }
+
+            // Convert path
+            let wide: Vec<u16> = file_path.encode_utf16().chain(Some(0)).collect();
+
+            // Create IShellItem
+            let shell_item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None)
+                .map_err(|_| crate::Error::NotFound)?;
+
+            // Get IShellItemImageFactory
+            let image_factory: IShellItemImageFactory =
+                shell_item.cast().map_err(|_| crate::Error::NotFound)?;
+
+            // Request thumbnail
+            let size = SIZE {
+                cx: width as i32,
+                cy: height as i32,
+            };
+
+            let hbitmap: HBITMAP = image_factory
+                .GetImage(size, SIIGBF_BIGGERSIZEOK)
+                .map_err(|_| crate::Error::NotFound)?;
+
+            // Convert HBITMAP → PNG bytes
+            let mut bmp = BITMAP::default();
+            GetObjectW(
+                HGDIOBJ(hbitmap.0),
+                std::mem::size_of::<BITMAP>() as i32,
+                Some(&mut bmp as *mut _ as *mut core::ffi::c_void),
+            );
+
+            let width = bmp.bmWidth as u32;
+            let height = bmp.bmHeight as u32;
+
+            let mut buffer = vec![0u8; (width * height * 4) as usize];
+
+            let hdc = GetDC(HWND(0));
+
+            let mut bmi = BITMAPINFO::default();
+            bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            bmi.bmiHeader.biWidth = width as i32;
+            bmi.bmiHeader.biHeight = -(height as i32); // top-down
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB.0;
+
+            GetDIBits(
+                hdc,
+                hbitmap,
+                0,
+                height as u32,
+                Some(buffer.as_mut_ptr() as *mut _),
+                &mut bmi,
+                DIB_RGB_COLORS,
+            );
+
+            ReleaseDC(HWND(0), hdc);
+            DeleteObject(HGDIOBJ(hbitmap.0));
+
+            // Encode to PNG
+            let img =
+                image::RgbaImage::from_raw(width, height, buffer).ok_or(crate::Error::NotFound)?;
+
+            let mut png_bytes = Vec::new();
+            img.write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .map_err(|_| crate::Error::NotFound)?;
+
+            Ok(png_bytes)
+        }
     }
 
     #[cfg(target_os = "macos")]
-    fn get_macos_thumbnail(&self, file_path: &str, width: u32, height: u32) -> crate::Result<Vec<u8>> {
+    fn get_macos_thumbnail(
+        &self,
+        file_path: &str,
+        width: u32,
+        height: u32,
+    ) -> crate::Result<Vec<u8>> {
         use std::process::Command;
 
-        let app_cache = self.0.path().app_cache_dir().unwrap_or_else(|_| std::env::temp_dir());
+        let app_cache = self
+            .0
+            .path()
+            .app_cache_dir()
+            .unwrap_or_else(|_| std::env::temp_dir());
         let plugin_cache = app_cache.join("tauri-plugin-thumbnail");
         let _ = fs::create_dir_all(&plugin_cache);
 
@@ -203,8 +298,10 @@ impl<R: Runtime> Thumbnail<R> {
         let ql_output = Command::new("qlmanage")
             .args([
                 "-t",
-                "-s", &width.to_string(),
-                "-o", plugin_cache.to_str().unwrap(),
+                "-s",
+                &width.to_string(),
+                "-o",
+                plugin_cache.to_str().unwrap(),
                 file_path,
             ])
             .output();
@@ -229,9 +326,13 @@ impl<R: Runtime> Thumbnail<R> {
         let tmp_file = plugin_cache.join(format!("tmp_{}.png", hash));
         let sips_output = Command::new("sips")
             .args([
-                "-s", "format", "png", 
-                "-Z", &width.max(height).to_string(), 
-                "-o", tmp_file.to_str().unwrap(), 
+                "-s",
+                "format",
+                "png",
+                "-Z",
+                &width.max(height).to_string(),
+                "-o",
+                tmp_file.to_str().unwrap(),
                 file_path,
             ])
             .output();
@@ -249,7 +350,12 @@ impl<R: Runtime> Thumbnail<R> {
         Err(crate::Error::NotFound)
     }
 
-    fn generate_video_thumbnail(&self, path: &Path, width: u32, height: u32) -> crate::Result<Vec<u8>> {
+    fn generate_video_thumbnail(
+        &self,
+        path: &Path,
+        width: u32,
+        height: u32,
+    ) -> crate::Result<Vec<u8>> {
         let temp_dir = std::env::temp_dir();
         let thumb_path = temp_dir.join(format!("v_thumb_{}.png", hash_path(path)));
 
@@ -257,10 +363,14 @@ impl<R: Runtime> Thumbnail<R> {
             .args([
                 "-i",
                 &path.to_string_lossy(),
-                "-ss", "00:00:01",
-                "-vframes", "1",
-                "-s", &format!("{}x{}", width, height),
-                "-f", "image2",
+                "-ss",
+                "00:00:01",
+                "-vframes",
+                "1",
+                "-s",
+                &format!("{}x{}", width, height),
+                "-f",
+                "image2",
                 "-y",
                 thumb_path.to_str().unwrap(),
             ])
@@ -277,7 +387,12 @@ impl<R: Runtime> Thumbnail<R> {
         Err(crate::Error::NotFound)
     }
 
-    fn generate_pdf_thumbnail(&self, path: &Path, width: u32, _height: u32) -> crate::Result<Vec<u8>> {
+    fn generate_pdf_thumbnail(
+        &self,
+        path: &Path,
+        width: u32,
+        _height: u32,
+    ) -> crate::Result<Vec<u8>> {
         let temp_dir = std::env::temp_dir();
         let thumb_prefix = temp_dir.join(format!("p_thumb_{}", hash_path(path)));
         let thumb_path = temp_dir.join(format!("p_thumb_{}.png", hash_path(path)));
@@ -285,9 +400,12 @@ impl<R: Runtime> Thumbnail<R> {
         let output = std::process::Command::new("pdftoppm")
             .args([
                 "-png",
-                "-f", "1",
-                "-l", "1",
-                "-scale-to", &width.to_string(),
+                "-f",
+                "1",
+                "-l",
+                "1",
+                "-scale-to",
+                &width.to_string(),
                 "-singlefile",
                 &path.to_string_lossy(),
                 thumb_prefix.to_str().unwrap(),
@@ -324,7 +442,7 @@ fn optimize_thumbnail_size(mut data: Vec<u8>) -> crate::Result<Vec<u8>> {
         resized.write_to(&mut buffer, ImageFormat::Png)?;
         data = buffer.into_inner();
     }
-    
+
     Ok(data)
 }
 
