@@ -15,7 +15,7 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
   api: PluginApi<R, C>,
 ) -> crate::Result<Thumbnail<R>> {
   #[cfg(target_os = "android")]
-  let handle = api.register_android_plugin("", "ThumbnailPlugin")?;
+  let handle = api.register_android_plugin("com.tauri.thumbnail", "ThumbnailPlugin")?;
   #[cfg(target_os = "ios")]
   let handle = api.register_ios_plugin(init_plugin_thumbnail)?;
   Ok(Thumbnail(handle))
