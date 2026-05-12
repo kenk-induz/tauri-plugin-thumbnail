@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use std::fs::{self, File};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use tauri::{plugin::PluginApi, AppHandle, Runtime};
+use tauri::{plugin::PluginApi, AppHandle, Runtime, Manager};
 use url::Url;
 
 /// Maximum size for a thumbnail to be considered "ready" without further compression.
