@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use std::fs::{self, File};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use tauri::{plugin::PluginApi, AppHandle, Runtime, Manager};
+use tauri::{plugin::PluginApi, AppHandle, Runtime};
 use url::Url;
 
 /// Maximum size for a thumbnail to be considered "ready" without further compression.
@@ -45,8 +45,9 @@ impl<R: Runtime> Thumbnail<R> {
         {
             if let Ok(thumb_data) = self.get_linux_thumbnail(&payload.path) {
                 debug!("Found native Linux thumbnail for {}", payload.path);
+                let constrained = constrain_to_size(thumb_data, width, height)?;
                 return Ok(GetThumbnailResponse {
-                    thumbnail: thumb_data,
+                    thumbnail: constrained,
                     mime_type: "image/png".to_string(),
                 });
             }
@@ -56,8 +57,9 @@ impl<R: Runtime> Thumbnail<R> {
         {
             if let Ok(thumb_data) = self.get_macos_thumbnail(&payload.path, width, height) {
                 debug!("Found native macOS thumbnail for {}", payload.path);
+                let constrained = constrain_to_size(thumb_data, width, height)?;
                 return Ok(GetThumbnailResponse {
-                    thumbnail: thumb_data,
+                    thumbnail: constrained,
                     mime_type: "image/png".to_string(),
                 });
             }
@@ -67,8 +69,9 @@ impl<R: Runtime> Thumbnail<R> {
         {
             if let Ok(thumb_data) = self.get_windows_thumbnail(&payload.path, width, height) {
                 debug!("Found native Windows thumbnail for {}", payload.path);
+                let constrained = constrain_to_size(thumb_data, width, height)?;
                 return Ok(GetThumbnailResponse {
-                    thumbnail: thumb_data,
+                    thumbnail: constrained,
                     mime_type: "image/png".to_string(),
                 });
             }
@@ -426,7 +429,7 @@ impl<R: Runtime> Thumbnail<R> {
     }
 }
 
-fn optimize_thumbnail_size(mut data: Vec<u8>) -> crate::Result<Vec<u8>> {
+pub fn optimize_thumbnail_size(mut data: Vec<u8>) -> crate::Result<Vec<u8>> {
     if data.len() <= MAX_THUMBNAIL_SIZE {
         return Ok(data);
     }
@@ -448,6 +451,271 @@ fn optimize_thumbnail_size(mut data: Vec<u8>) -> crate::Result<Vec<u8>> {
     Ok(data)
 }
 
-fn hash_path(path: &Path) -> String {
+pub fn hash_path(path: &Path) -> String {
     format!("{:x}", md5::compute(path.to_string_lossy().as_bytes()))
 }
+
+/// Decodes `data` as an image and resizes it so that both dimensions
+/// are within `max_width × max_height`, preserving the aspect ratio.
+/// If the image already fits, the original bytes are returned unchanged.
+pub fn constrain_to_size(data: Vec<u8>, max_width: u32, max_height: u32) -> crate::Result<Vec<u8>> {
+    let img = image::load_from_memory(&data)?;
+    if img.width() <= max_width && img.height() <= max_height {
+        return Ok(data);
+    }
+    let resized = img.thumbnail(max_width, max_height);
+    let mut buffer = Cursor::new(Vec::new());
+    resized.write_to(&mut buffer, ImageFormat::Png)?;
+    optimize_thumbnail_size(buffer.into_inner())
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod desktop_test_helpers {
+    use super::*;
+
+    pub fn get_thumbnail_core(
+        payload: crate::models::GetThumbnailRequest,
+    ) -> crate::Result<crate::models::GetThumbnailResponse> {
+        let path = Path::new(&payload.path);
+        if !path.exists() {
+            return Err(crate::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("File not found: {}", payload.path),
+            )));
+        }
+
+        let width = payload.width.unwrap_or(128);
+        let height = payload.height.unwrap_or(128);
+
+        let mut file = File::open(path)?;
+        let mut header = [0u8; 8192];
+        let read_count = file.read(&mut header)?;
+        let kind = infer::get(&header[..read_count]);
+        let mime = kind
+            .map(|k| k.mime_type())
+            .unwrap_or("application/octet-stream");
+
+        if mime.starts_with("image/") {
+            let file_content = fs::read(path)?;
+            let img = image::load_from_memory(&file_content)?;
+            let thumb = img.thumbnail(width, height);
+
+            let mut buffer = Cursor::new(Vec::new());
+            thumb.write_to(&mut buffer, ImageFormat::Png)?;
+
+            let thumb_data = optimize_thumbnail_size(buffer.into_inner())?;
+            return Ok(GetThumbnailResponse {
+                thumbnail: thumb_data,
+                mime_type: "image/png".to_string(),
+            });
+        }
+
+        if mime.starts_with("audio/") {
+            if let Ok(tag) = id3::Tag::read_from_path(path) {
+                if let Some(picture) = tag.pictures().next() {
+                    let img = image::load_from_memory(&picture.data)?;
+                    let thumb = img.thumbnail(width, height);
+
+                    let mut buffer = Cursor::new(Vec::new());
+                    thumb.write_to(&mut buffer, ImageFormat::Png)?;
+
+                    let thumb_data = optimize_thumbnail_size(buffer.into_inner())?;
+                    return Ok(GetThumbnailResponse {
+                        thumbnail: thumb_data,
+                        mime_type: "image/png".to_string(),
+                    });
+                }
+            }
+        }
+
+        if mime.starts_with("video/") {
+            if let Ok(thumb_data) = generate_video_thumbnail_core(path, width, height) {
+                return Ok(GetThumbnailResponse {
+                    thumbnail: thumb_data,
+                    mime_type: "image/png".to_string(),
+                });
+            }
+        }
+
+        if mime == "application/pdf" {
+            if let Ok(thumb_data) = generate_pdf_thumbnail_core(path, width, height) {
+                return Ok(GetThumbnailResponse {
+                    thumbnail: thumb_data,
+                    mime_type: "image/png".to_string(),
+                });
+            }
+        }
+
+        Err(crate::Error::NotFound)
+    }
+
+    pub fn generate_video_thumbnail_core(
+        path: &Path,
+        width: u32,
+        height: u32,
+    ) -> crate::Result<Vec<u8>> {
+        let temp_dir = std::env::temp_dir();
+        let thumb_path = temp_dir.join(format!("v_thumb_{}.png", hash_path(path)));
+
+        let output = std::process::Command::new("ffmpeg")
+            .args([
+                "-i",
+                &path.to_string_lossy(),
+                "-ss",
+                "00:00:01",
+                "-vframes",
+                "1",
+                "-s",
+                &format!("{}x{}", width, height),
+                "-f",
+                "image2",
+                "-y",
+                thumb_path.to_str().unwrap(),
+            ])
+            .output();
+
+        if let Ok(out) = output {
+            if out.status.success() {
+                if let Ok(data) = fs::read(&thumb_path) {
+                    let _ = fs::remove_file(thumb_path);
+                    return optimize_thumbnail_size(data);
+                }
+            }
+        }
+        Err(crate::Error::NotFound)
+    }
+
+    pub fn generate_pdf_thumbnail_core(
+        path: &Path,
+        width: u32,
+        _height: u32,
+    ) -> crate::Result<Vec<u8>> {
+        let temp_dir = std::env::temp_dir();
+        let thumb_prefix = temp_dir.join(format!("p_thumb_{}", hash_path(path)));
+        let thumb_path = temp_dir.join(format!("p_thumb_{}.png", hash_path(path)));
+
+        let output = std::process::Command::new("pdftoppm")
+            .args([
+                "-png",
+                "-f",
+                "1",
+                "-l",
+                "1",
+                "-scale-to",
+                &width.to_string(),
+                "-singlefile",
+                &path.to_string_lossy(),
+                thumb_prefix.to_str().unwrap(),
+            ])
+            .output();
+
+        if let Ok(out) = output {
+            if out.status.success() {
+                if let Ok(data) = fs::read(&thumb_path) {
+                    let _ = fs::remove_file(thumb_path);
+                    return optimize_thumbnail_size(data);
+                }
+            }
+        }
+        Err(crate::Error::NotFound)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn get_linux_thumbnail_core(file_path: &str) -> crate::Result<Vec<u8>> {
+        let abs_path = fs::canonicalize(file_path)?;
+        let uri = Url::from_file_path(&abs_path).map_err(|_| crate::Error::NotFound)?;
+        let hash = format!("{:x}", md5::compute(uri.as_str()));
+
+        let cache_dir = std::env::var("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home_dir().map(|h| h.join(".cache")).unwrap_or_default());
+
+        if cache_dir.as_os_str().is_empty() {
+            return Err(crate::Error::NotFound);
+        }
+
+        let thumb_dirs = [
+            cache_dir.join("thumbnails/large"),
+            cache_dir.join("thumbnails/normal"),
+            cache_dir.join("thumbnails/x-large"),
+            cache_dir.join("thumbnails/xx-large"),
+        ];
+
+        for dir in thumb_dirs {
+            let thumb_path = dir.join(format!("{}.png", hash));
+            if thumb_path.exists() {
+                return Ok(fs::read(thumb_path)?);
+            }
+        }
+
+        Err(crate::Error::NotFound)
+    }
+
+    pub use super::{constrain_to_size, hash_path, optimize_thumbnail_size};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_optimize_small_image_passthrough() {
+        let img = image::RgbaImage::new(32, 32);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let data = buf.into_inner();
+        let original_len = data.len();
+        let result = optimize_thumbnail_size(data).unwrap();
+        assert_eq!(result.len(), original_len, "Small image should not be resized");
+    }
+
+    #[test]
+    fn test_optimize_large_image_shrinks() {
+        let mut img = image::RgbaImage::new(500, 500);
+        for (i, pixel) in img.pixels_mut().enumerate() {
+            *pixel = image::Rgba([
+                (i * 37 % 256) as u8,
+                (i * 73 % 256) as u8,
+                (i * 109 % 256) as u8,
+                255,
+            ]);
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let data = buf.into_inner();
+        assert!(
+            data.len() > MAX_THUMBNAIL_SIZE,
+            "Pre-condition: test data must exceed MAX_THUMBNAIL_SIZE"
+        );
+
+        let result = optimize_thumbnail_size(data).unwrap();
+        assert!(
+            result.len() <= MAX_THUMBNAIL_SIZE,
+            "Optimized image must be <= MAX_THUMBNAIL_SIZE"
+        );
+    }
+
+    #[test]
+    fn test_hash_path_deterministic() {
+        let p = Path::new("/some/file.png");
+        assert_eq!(hash_path(p), hash_path(p));
+    }
+
+    #[test]
+    fn test_hash_path_different_for_different_paths() {
+        let h1 = hash_path(Path::new("/a/b.png"));
+        let h2 = hash_path(Path::new("/c/d.png"));
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_hash_path_hex_format() {
+        let h = hash_path(Path::new("/test/path"));
+        assert!(
+            h.chars().all(|c| c.is_ascii_hexdigit()),
+            "Hash should be hex string, got: {}",
+            h
+        );
+    }
+}
+

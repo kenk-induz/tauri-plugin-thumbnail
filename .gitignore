@@ -15,3 +15,6 @@ node_modules/
 
 dist-js
 dist
+
+# Test fixture files (local-only, never committed)
+tests/fixtures/

@@ -32,3 +32,12 @@ windows = { version = "0.54", default-features = false, features = [
 
 [build-dependencies]
 tauri-plugin = { version = "2.5.4", features = ["build"] }
+
+[features]
+# Exposes internal helpers for integration testing
+test-helpers = []
+
+[dev-dependencies]
+tauri-plugin-thumbnail = { path = ".", features = ["test-helpers"] }
+tempfile = "3"
+

@@ -7,6 +7,8 @@ pub use models::*;
 
 #[cfg(desktop)]
 mod desktop;
+#[cfg(all(desktop, any(test, feature = "test-helpers")))]
+pub use desktop::desktop_test_helpers;
 #[cfg(mobile)]
 mod mobile;
 
