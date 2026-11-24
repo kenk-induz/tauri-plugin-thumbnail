@@ -1,7 +1,6 @@
 [package]
 name = "tauri-plugin-thumbnail"
 version = "0.1.0"
-authors = [ "kenk-induz" ]
 description = "A Tauri plugin to generate and retrieve file thumbnails across Windows, Linux, and macOS."
 repository = "https://github.com/kenk-induz/tauri-plugin-thumbnail"
 edition = "2021"

@@ -45,6 +45,7 @@ impl<R: Runtime> Thumbnail<R> {
         {
             if let Ok(thumb_data) = self.get_linux_thumbnail(&payload.path) {
                 debug!("Found native Linux thumbnail for {}", payload.path);
+                // For native thumbnails, we still constrain to the requested size
                 let constrained = constrain_to_size(thumb_data, width, height)?;
                 return Ok(GetThumbnailResponse {
                     thumbnail: constrained,
@@ -57,6 +58,7 @@ impl<R: Runtime> Thumbnail<R> {
         {
             if let Ok(thumb_data) = self.get_macos_thumbnail(&payload.path, width, height) {
                 debug!("Found native macOS thumbnail for {}", payload.path);
+                // For native thumbnails, we still constrain to the requested size
                 let constrained = constrain_to_size(thumb_data, width, height)?;
                 return Ok(GetThumbnailResponse {
                     thumbnail: constrained,
@@ -69,6 +71,7 @@ impl<R: Runtime> Thumbnail<R> {
         {
             if let Ok(thumb_data) = self.get_windows_thumbnail(&payload.path, width, height) {
                 debug!("Found native Windows thumbnail for {}", payload.path);
+                // For native thumbnails, we still constrain to the requested size
                 let constrained = constrain_to_size(thumb_data, width, height)?;
                 return Ok(GetThumbnailResponse {
                     thumbnail: constrained,
@@ -96,13 +99,7 @@ impl<R: Runtime> Thumbnail<R> {
         if mime.starts_with("image/") {
             // Re-read for image crate (full load is unfortunately often required for images)
             let file_content = fs::read(path)?;
-            let img = image::load_from_memory(&file_content)?;
-            let thumb = img.thumbnail(width, height);
-
-            let mut buffer = Cursor::new(Vec::new());
-            thumb.write_to(&mut buffer, ImageFormat::Png)?;
-
-            let thumb_data = optimize_thumbnail_size(buffer.into_inner())?;
+            let thumb_data = generate_and_constrain_thumbnail(file_content, width, height)?;
             return Ok(GetThumbnailResponse {
                 thumbnail: thumb_data,
                 mime_type: "image/png".to_string(),
@@ -113,13 +110,7 @@ impl<R: Runtime> Thumbnail<R> {
         if mime.starts_with("audio/") {
             if let Ok(tag) = id3::Tag::read_from_path(path) {
                 if let Some(picture) = tag.pictures().next() {
-                    let img = image::load_from_memory(&picture.data)?;
-                    let thumb = img.thumbnail(width, height);
-
-                    let mut buffer = Cursor::new(Vec::new());
-                    thumb.write_to(&mut buffer, ImageFormat::Png)?;
-
-                    let thumb_data = optimize_thumbnail_size(buffer.into_inner())?;
+                    let thumb_data = generate_and_constrain_thumbnail(picture.data.to_vec(), width, height)?;
                     return Ok(GetThumbnailResponse {
                         thumbnail: thumb_data,
                         mime_type: "image/png".to_string(),
@@ -385,7 +376,8 @@ impl<R: Runtime> Thumbnail<R> {
             if out.status.success() {
                 if let Ok(data) = fs::read(&thumb_path) {
                     let _ = fs::remove_file(thumb_path);
-                    return optimize_thumbnail_size(data);
+                    // The ffmpeg command already attempts to resize, but we still apply final constraint
+                    return constrain_to_size(data, width, height);
                 }
             }
         }
@@ -396,7 +388,7 @@ impl<R: Runtime> Thumbnail<R> {
         &self,
         path: &Path,
         width: u32,
-        _height: u32,
+        height: u32,
     ) -> crate::Result<Vec<u8>> {
         let temp_dir = std::env::temp_dir();
         let thumb_prefix = temp_dir.join(format!("p_thumb_{}", hash_path(path)));
@@ -421,7 +413,8 @@ impl<R: Runtime> Thumbnail<R> {
             if out.status.success() {
                 if let Ok(data) = fs::read(&thumb_path) {
                     let _ = fs::remove_file(thumb_path);
-                    return optimize_thumbnail_size(data);
+                    // The pdftoppm command already attempts to resize, but we still apply final constraint
+                    return constrain_to_size(data, width, height);
                 }
             }
         }
@@ -469,6 +462,18 @@ pub fn constrain_to_size(data: Vec<u8>, max_width: u32, max_height: u32) -> crat
     optimize_thumbnail_size(buffer.into_inner())
 }
 
+/// Generate a thumbnail from image data and constrain it to the requested dimensions
+pub fn generate_and_constrain_thumbnail(data: Vec<u8>, width: u32, height: u32) -> crate::Result<Vec<u8>> {
+    let img = image::load_from_memory(&data)?;
+    let thumb = img.thumbnail(width, height);
+    
+    let mut buffer = Cursor::new(Vec::new());
+    thumb.write_to(&mut buffer, ImageFormat::Png)?;
+    
+    let thumb_data = optimize_thumbnail_size(buffer.into_inner())?;
+    Ok(thumb_data)
+}
+
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod desktop_test_helpers {
     use super::*;
@@ -497,13 +502,7 @@ pub mod desktop_test_helpers {
 
         if mime.starts_with("image/") {
             let file_content = fs::read(path)?;
-            let img = image::load_from_memory(&file_content)?;
-            let thumb = img.thumbnail(width, height);
-
-            let mut buffer = Cursor::new(Vec::new());
-            thumb.write_to(&mut buffer, ImageFormat::Png)?;
-
-            let thumb_data = optimize_thumbnail_size(buffer.into_inner())?;
+            let thumb_data = generate_and_constrain_thumbnail(file_content, width, height)?;
             return Ok(GetThumbnailResponse {
                 thumbnail: thumb_data,
                 mime_type: "image/png".to_string(),
@@ -513,13 +512,7 @@ pub mod desktop_test_helpers {
         if mime.starts_with("audio/") {
             if let Ok(tag) = id3::Tag::read_from_path(path) {
                 if let Some(picture) = tag.pictures().next() {
-                    let img = image::load_from_memory(&picture.data)?;
-                    let thumb = img.thumbnail(width, height);
-
-                    let mut buffer = Cursor::new(Vec::new());
-                    thumb.write_to(&mut buffer, ImageFormat::Png)?;
-
-                    let thumb_data = optimize_thumbnail_size(buffer.into_inner())?;
+                    let thumb_data = generate_and_constrain_thumbnail(picture.data.to_vec(), width, height)?;
                     return Ok(GetThumbnailResponse {
                         thumbnail: thumb_data,
                         mime_type: "image/png".to_string(),
